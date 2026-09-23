@@ -636,7 +636,11 @@ void RenderInterface_VK::Initialize_Swapchain(VkExtent2D window_extent) noexcept
 	info.compositeAlpha = ChooseSwapchainCompositeAlpha();
 	info.imageArrayLayers = 1;
 	info.presentMode = GetPresentMode();
-	info.oldSwapchain = nullptr;
+	// Wayland: dùng oldSwapchain TRANSFER để driver reclaim image cũ một cách an toàn (không cần drain device-wide
+	// qua vkDeviceWaitIdle — điều này DEADLOCK khi compositor fullscreen còn giữ frame present). Lưu sẵn handle cũ rồi
+	// destroy sau khi create mới thành công.
+	VkSwapchainKHR old_swapchain = m_p_swapchain;
+	info.oldSwapchain = old_swapchain;
 	info.clipped = true;
 	info.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 	info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -656,6 +660,12 @@ void RenderInterface_VK::Initialize_Swapchain(VkExtent2D window_extent) noexcept
 	}
 
 	VkResult status = vkCreateSwapchainKHR(m_p_device, &info, nullptr, &m_p_swapchain);
+
+	if (status == VK_SUCCESS && old_swapchain != VK_NULL_HANDLE)
+	{
+		// image cũ đã được transfer sang swapchain mới — giờ mới an toàn để destroy handle cũ
+		vkDestroySwapchainKHR(m_p_device, old_swapchain, nullptr);
+	}
 
 	RMLUI_VK_ASSERTMSG(status == VK_SUCCESS, "failed to vkCreateSwapchainKHR");
 }
@@ -2897,9 +2907,23 @@ void RenderInterface_VK::Wait() noexcept
 	}
 
 	// the acquire happens AFTER the fence wait on purpose: the wait proves the GPU consumed this slot's
-	// image-available semaphore (its last wait completed), so re-signaling it here is always safe
-	auto status = vkAcquireNextImageKHR(m_p_device, m_p_swapchain, kMaxUint64, m_semaphores_image_available[m_semaphore_index_previous], nullptr,
-		&m_image_index);
+	// image-available semaphore (its last wait completed), so re-signaling it here is always safe.
+	// KHÔNG BAO GIỜ render vào image đã out-of-date: nếu vkAcquireNextImageKHR trả OUT_OF_DATE/SUBOPTIMAL (fullscreen
+	// Wayland + fractional scaling gây reconfigure surface), recreate swapchain (drain-free, oldSwapchain transfer —
+	// không gọi vkDeviceWaitIdle) rồi re-acquire. Đây là điểm an toàn: chạy ngay đầu BeginFrame trước khi record
+	// command buffer. Giới hạn số lần retry để không spin vô hạn.
+	int acquire_attempts = 0;
+	VkResult status = VK_SUCCESS;
+	do
+	{
+		if (acquire_attempts > 0)
+			RecreateSwapchain();
+		status = vkAcquireNextImageKHR(m_p_device, m_p_swapchain, kMaxUint64, m_semaphores_image_available[m_semaphore_index_previous],
+			nullptr, &m_image_index);
+		++acquire_attempts;
+	} while ((status == VK_ERROR_OUT_OF_DATE_KHR || status == VK_SUBOPTIMAL_KHR) && acquire_attempts < 8);
+
+	m_swapchain_needs_recreate = false;
 	RMLUI_VK_ASSERTMSG(status == VkResult::VK_SUCCESS, "failed to vkAcquireNextImageKHR (see status)");
 }
 
@@ -2952,7 +2976,11 @@ void RenderInterface_VK::Present() noexcept
 	{
 		if (status == VK_ERROR_OUT_OF_DATE_KHR || status == VK_SUBOPTIMAL_KHR)
 		{
-			RecreateSwapchain();
+			// Wayland: KHÔNG recreate swapchain ngay ở đây (bên trong EndFrame). vkDestroySwapchainKHR bên trong
+			// RecreateSwapchain() sẽ block forever vì compositor còn giữ frame vừa present (deadlock). Chỉ đánh dấu
+			// cần recreate; app sẽ đợi frame boundary -> gọi RecreateSwapchain() trước vkAcquireNextImageKHR (mô hình
+			// Chrome/Dota 2).
+			m_swapchain_needs_recreate = true;
 		}
 		else
 		{
@@ -3433,13 +3461,40 @@ void RenderInterface_VK::SetViewport(int width, int height)
 bool RenderInterface_VK::IsSwapchainValid()
 {
 	RMLUI_ZoneScopedN("Vulkan - IsSwapchainValid");
-	return m_p_swapchain != nullptr;
+	// Xem swapchain còn dùng được không: còn tồn tại VÀ chưa bị đánh dấu cần recreate (Out-of-date sau fullscreen/
+	// resize trên Wayland).
+	return m_p_swapchain != nullptr && !m_swapchain_needs_recreate;
 }
 
 void RenderInterface_VK::RecreateSwapchain()
 {
-	RMLUI_ZoneScopedN("Vulkan - RecreateSwapchain");
-	SetViewport(m_width, m_height);
+	RMLUI_ZoneScopedN("Vulkan - RecreateSwapchain (Wayland-safe)");
+
+	VkExtent2D window_extent = GetValidSurfaceExtent();
+	if (window_extent.width == 0 || window_extent.height == 0)
+	{
+		// Chưa được compositor Wayland cấp kích thước hợp lệ -> giữ cờ chờ, retry ở vòng sau (tránh recreate extent=0).
+		m_swapchain_needs_recreate = true;
+		return;
+	}
+
+	// WAYLAND: KHÔNG gọi Flush()/vkDeviceWaitIdle() (bị DEADLOCK vì compositor fullscreen còn giữ frame present).
+	// Drain được thực hiện an toàn qua: (1) fence ring chờ trong Wait() ở frame kế tiếp, (2) oldSwapchain TRANSFER
+	// trong Initialize_Swapchain giúp driver reclaim image cũ mà không cần device-wide idle.
+	if (m_p_swapchain)
+	{
+		DestroyResourcesDependentOnSize();
+		// KHÔNG destroy m_p_swapchain ở đây — giữ làm oldSwapchain cho Initialize_Swapchain (transfer) bên dưới.
+	}
+
+	m_width = window_extent.width;
+	m_height = window_extent.height;
+
+	// Reset cờ TRƯỚC khi dựng lại để IsSwapchainValid() trả true sau khi recreate thành công.
+	m_swapchain_needs_recreate = false;
+
+	Initialize_Swapchain(window_extent);
+	Create_ResourcesDependentOnSize(window_extent);
 }
 
 void RenderInterface_VK::UseProgram(ProgramId id)

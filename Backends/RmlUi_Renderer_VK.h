@@ -754,6 +754,11 @@ private:
 	VkSurfaceKHR m_p_surface;
 	VkSwapchainKHR m_p_swapchain;
 	VmaAllocator m_p_allocator;
+	// Wayland: khi Present() nhận VK_ERROR_OUT_OF_DATE_KHR/SUBOPTIMAL, ta KHÔNG recreate swapchain ngay trong
+	// EndFrame (vkDestroySwapchainKHR block forever vì compositor còn giữ frame đã present — deadlock). Thay vào đó
+	// chỉ set cờ này, đặt lại frame boundary thông qua IsSwapchainValid()==false → app gọi RecreateSwapchain() trước
+	// vkAcquireNextImageKHR (đúng pattern của Chrome/Dota 2).
+	bool m_swapchain_needs_recreate = false;
 	// @ obtained from the command buffer ring, see BeginFrame method
 	VkCommandBuffer m_p_current_command_buffer;
 
