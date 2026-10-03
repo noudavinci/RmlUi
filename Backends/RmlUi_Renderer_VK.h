@@ -609,7 +609,7 @@ private:
 	VkSurfaceTransformFlagBitsKHR CreatePretransformSwapchain() noexcept;
 	VkCompositeAlphaFlagBitsKHR ChooseSwapchainCompositeAlpha() noexcept;
 	int Choose_SwapchainImageCount(uint32_t user_swapchain_count_for_creation = kSwapchainBackBufferCount, bool if_failed_choose_min = true) noexcept;
-	VkPresentModeKHR GetPresentMode(VkPresentModeKHR type = VkPresentModeKHR::VK_PRESENT_MODE_FIFO_KHR) noexcept;
+	VkPresentModeKHR GetPresentMode(VkPresentModeKHR type = VkPresentModeKHR::VK_PRESENT_MODE_IMMEDIATE_KHR) noexcept;
 	VkSurfaceCapabilitiesKHR GetSurfaceCapabilities() noexcept;
 
 	VkExtent2D GetValidSurfaceExtent() noexcept;

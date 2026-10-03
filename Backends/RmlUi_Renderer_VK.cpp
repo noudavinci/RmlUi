@@ -11,6 +11,7 @@
 #include <RmlUi/Core/Profiling.h>
 #include <RmlUi/Core/SystemInterface.h>
 #include <algorithm>
+#include <cstdio>
 #include <math.h>
 #include <string.h>
 
@@ -635,7 +636,11 @@ void RenderInterface_VK::Initialize_Swapchain(VkExtent2D window_extent) noexcept
 	info.preTransform = CreatePretransformSwapchain();
 	info.compositeAlpha = ChooseSwapchainCompositeAlpha();
 	info.imageArrayLayers = 1;
-	info.presentMode = GetPresentMode();
+	// Present mode IMMEDIATE: bỏ chờ VSYNC khi vkAcquireNextImageKHR (kMaxUint64) trong BeginFrame —
+	// FIFO (vsync) làm BeginFrame block 40-400ms khi present queue không release image kịp → trễ visual
+	// (hover/drag). IMMEDIATE trả image ngay khi present xong → giảm latency. On-demand loop không bị
+	// tearing khi UI tĩnh (không present); khi có thay đổi present tức thì.
+	info.presentMode = GetPresentMode(VkPresentModeKHR::VK_PRESENT_MODE_IMMEDIATE_KHR);
 	// Wayland: dùng oldSwapchain TRANSFER để driver reclaim image cũ một cách an toàn (không cần drain device-wide
 	// qua vkDeviceWaitIdle — điều này DEADLOCK khi compositor fullscreen còn giữ frame present). Lưu sẵn handle cũ rồi
 	// destroy sau khi create mới thành công.
@@ -1508,8 +1513,6 @@ VkPresentModeKHR RenderInterface_VK::GetPresentMode(VkPresentModeKHR required) n
 	RMLUI_ASSERT(m_p_physical_device && "you must initialize your physical device, before calling this method");
 	RMLUI_ASSERT(m_p_surface && "you must initialize your surface, before calling this method");
 
-	VkPresentModeKHR result = required;
-
 	uint32_t present_modes_count = 0;
 	VkResult status = vkGetPhysicalDeviceSurfacePresentModesKHR(m_p_physical_device, m_p_surface, &present_modes_count, nullptr);
 	RMLUI_VK_ASSERTMSG(status == VK_SUCCESS, "[Vulkan] failed to vkGetPhysicalDeviceSurfacePresentModesKHR (getting count)");
@@ -1518,11 +1521,53 @@ VkPresentModeKHR RenderInterface_VK::GetPresentMode(VkPresentModeKHR required) n
 	status = vkGetPhysicalDeviceSurfacePresentModesKHR(m_p_physical_device, m_p_surface, &present_modes_count, present_modes.data());
 	RMLUI_VK_ASSERTMSG(status == VK_SUCCESS, "[Vulkan] failed to vkGetPhysicalDeviceSurfacePresentModesKHR (filling vector of VkPresentModeKHR)");
 
-	for (const auto& mode : present_modes)
+	// Ưu tiên chọn present mode có độ trễ thấp nhất mà surface HỖ TRỢ, theo thứ tự:
+	//   required (IMMEDIATE) -> MAILBOX -> FIFO.
+	// Trước đây chỉ hardcode `required` rồi rơi về front() mù khi không có — KHÔNG được,
+	// vì trên Wayland nhiều compositor không expose VK_PRESENT_MODE_IMMEDIATE_KHR → rơi về
+	// front() (thường FIFO) → BeginFrame block vô hạn trong vkAcquireNextImageKHR (trễ visual).
+	// MAILBOX (triple-buffer, không vsync-block, không tearing) là bước đệm tốt khi IMMEDIATE vắng mặt.
+	VkPresentModeKHR preferred[] = {
+		required,
+		VkPresentModeKHR::VK_PRESENT_MODE_MAILBOX_KHR,
+		VkPresentModeKHR::VK_PRESENT_MODE_FIFO_KHR,
+	};
+	VkPresentModeKHR selected = VkPresentModeKHR::VK_PRESENT_MODE_FIFO_KHR;
+	bool found = false;
+	for (const auto pref : preferred)
 	{
-		if (mode == required)
-			return result;
+		for (const auto& mode : present_modes)
+		{
+			if (mode == pref)
+			{
+				selected = pref;
+				found = true;
+				break;
+			}
+		}
+		if (found)
+			break;
 	}
+
+	// Log CHỈ 1 lần (GetPresentMode gọi mỗi lần tạo/recreate swapchain — tránh spam
+	// console) in danh sách present mode khả dụng + mode được chọn. VkPresentModeKHR:
+	// 0=immediate, 1=mailbox, 2=fifo.
+	static bool present_mode_logged = false;
+	if (!present_mode_logged)
+	{
+		present_mode_logged = true;
+		char dbg[256];
+		int off = 0;
+		off += std::snprintf(dbg + off, sizeof(dbg) - off,
+			"[Vulkan] present modes available (%d):", static_cast<int>(present_modes.size()));
+		for (const auto& m : present_modes)
+			off += std::snprintf(dbg + off, sizeof(dbg) - off, " %d", static_cast<int>(m));
+		Rml::Log::Message(Rml::Log::LT_INFO, "%s", dbg);
+		Rml::Log::Message(Rml::Log::LT_INFO, "[Vulkan] present mode selected: %d", static_cast<int>(selected));
+	}
+
+	if (found)
+		return selected;
 
 	Rml::Log::Message(Rml::Log::LT_WARNING,
 		"[Vulkan] WARNING system can't detect your type of present mode so we choose the first from vector front");
